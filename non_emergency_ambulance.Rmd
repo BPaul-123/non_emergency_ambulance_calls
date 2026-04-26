@@ -1,0 +1,421 @@
+---
+title: "non_emergency_ambulance_calls"
+output:
+  html_document: default
+  pdf_document: default
+date: "2026-04-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+Install and load in the libraries
+
+```{r libraries}
+rm(list = ls())
+graphics.off()
+library(magrittr) 
+library(zoo)
+library(forecast)
+library(ggplot2)
+library(gridExtra)
+```
+
+# --------------------------------------------------------------
+# Exploratory Data Analysis and Data Preparation 
+# --------------------------------------------------------------
+
+```{r data upload }
+data <- read.table("/Users/bratatipaul/Documents/DATA_SC_USW/DATA_MINING/Ambulance/ambulance_calls.txt", row.names = NULL, sep =",", header=TRUE)
+data %>%
+  head()
+data %>%
+  tail()
+
+#order month as Jan 1, Feb 2 (not alphabatically)
+data$Month <- factor(data$Month, levels = month.abb, ordered = TRUE)
+data <- data[order(data$Year, data$Month), ]
+```
+
+# ---------------------------
+# Check for outliers (IQR)
+# ---------------------------
+
+```{r}
+Q1 <- quantile(data$Calls, 0.25, na.rm = TRUE)
+Q3 <- quantile(data$Calls, 0.75, na.rm = TRUE)
+IQR_val <- Q3 - Q1
+
+upper_range <- Q3 + (1.5 * IQR_val)
+
+outliers <- data[data$Calls > upper_range, ]
+
+print(paste("Upper Outlier Threshold:", round(upper_range, 2)))
+
+if (nrow(outliers) > 0) {
+  print("Detected Outliers:")
+  print(outliers)
+} else {
+  print("No outliers detected")
+}
+print("3750 and 3720 were identified as outliers but were retained as they are only marginally above the threshold.")
+
+```
+```{r}
+
+```
+
+
+```{r}
+# Check duplicates
+data[duplicated(data), ]
+```
+
+
+
+```{r}
+# Check missing values
+sum(is.na(data))
+```
+
+```{r}
+# Locate missing values
+which(apply(data, 1, function(x) any(is.na(x))))
+```
+
+
+
+```{r}
+# Inspect row with missing value
+data[87, ]
+```
+
+```{r}
+# Handle missing value
+data$Calls <- na.approx(data$Calls)
+```
+
+
+```{r}
+# Recheck missing values
+sum(is.na(data$Calls))
+```
+
+# ---------------------------
+# Create time series object
+# ---------------------------
+
+```{r}
+calls <- ts(data$Calls,
+            start = c(data$Year[1], as.numeric(data$Month[1])),
+            frequency = 12)
+
+# average monthly non-emergency calls
+avg <- mean(calls)
+cat("Average call in each month = ", round(avg,2))
+
+#plot raw series before any modelling
+plot(calls,
+     main = "Monthly non emergency calls",
+     ylab = "calls", xlab = "Time")
+abline(mean(calls), 0,
+       col= 'red') #mean line over the plot
+
+```
+
+# This series has clear upward trend and some seasonality is also present
+
+```{r}
+# checking variance over different window
+var_2013_17 <- var(window(calls, start=c(2013,1), end=c(2017,12)))
+cat("variance of average response time in window of 2023-2017:", round(var_2013_17,2))
+var_2018_20 <- var(window(calls, start=c(2018,1), end=c(2020,12)))
+cat("variance of average response time in window of 2018-2020:", round(var_2018_20,2))
+var_2021_22 <- var(window(calls, start=c(2021,1), end=c(2022,12)))
+cat("variance of average response time in window of 2021-2022:", round(var_2021_22,2))
+
+```
+
+#rolling variance grows over time.
+
+```{r}
+# Apply logarithmic transformation to stabilize variance
+log_calls <- log(calls)
+
+# Plot the log-transformed series to inspect trend and seasonality
+plot(log_calls, main = "non-emergency call(Log scaled)",
+     ylab = "log(calls)", xlab = "Time")
+abline(mean(log_calls), 0,
+       col= 'red')
+
+```
+
+```{r}
+# Autocorrelation plots to check auto-correlation and stationarity
+acf(log_calls, main = "ACF of original series(log scaled)", lag.max = 60)
+pacf(log_calls, main = "PACF of original series(log scaled)", lag.max = 60)
+
+```
+
+# Seasonality and Trend Assessment
+
+```{r seasonal pattern}
+# Seasonal pattern diagnostic
+
+# Seasonal plot: shows the shape of the typical annual cycle.
+seasonplot(log_calls, year.labels = TRUE,
+           main = "Seasonal variation of Calls",
+           ylab = "log(calls)", xlab = "Month")
+# in seasonal plot there is pattern like high for July, August for each year 
+
+# month plot: shows seasonal pattern across months
+monthplot(log_calls, year.labels = TRUE,
+           main = "Month wise variation of Calls",
+           ylab = "log(calls)", xlab = "Month")
+# The month plot shows a clear seasonal pattern similar to seasonal plot
+# indicating a systematic, repeating monthly structure.
+
+# Boxplots: show clear differences between months and their variability.
+boxplot(log_calls ~ cycle(log_calls),
+        main = "Monthly Variability of Ambulance Calls",
+        xlab = "Month", ylab = "log(calls)")
+
+# Quantify seasonality roughly
+month_means <- tapply(log_calls, cycle(log_calls), mean)
+seasonality_ratio <- var(month_means) / var(log_calls)
+cat("Seasonality ratio : ", round(seasonality_ratio,2))
+
+```
+
+# The series exhibits strong seasonal patterns, with peaks in 
+# July–August and variability across months, as shown by the monthplot, 
+# seasonplot, and boxplots also confirmed by the seasonality ratio.
+
+
+```{r trend pattern}
+# Trend pattern diagnostic
+
+# Trend inspection using rolling mean
+trend_ma <- rollmean(log_calls, 12, fill=NA)
+plot(trend_ma, main = "Rolling 12-Month Trend Mean", 
+     xlab = "Time", ylab = "log_calls")
+# rolling average plot shows a clear upward trend
+
+# Quantify trend -- linear regression
+summary(lm(calls ~ time(calls)))
+```
+
+# Time Series Decomposition
+
+```{r time series decomposition}
+# Seasonal-Trend decomposition using Loess (STL)
+
+stl_calls <- stl(log_calls, s.window = "periodic", t.window = 13) 
+# t.window = 13 means the trend is smoothed over a local window of 13 months.
+
+# Plot decomposition to visually inspect components
+plot(stl_calls, main = "STL Decomposition of non-emergency Ambulance Calls")
+
+# Extract components 
+seasonal_component <- stl_calls$time.series[, "seasonal"]
+trend_component <- stl_calls$time.series[, "trend"]
+remainder_component <- stl_calls$time.series[, "remainder"]
+
+summary(seasonal_component)
+summary(trend_component)
+summary(remainder_component)
+```
+# Transformation and Stationarity Assessment
+
+```{r}
+d <- ndiffs(log_calls)   # Suggested non-seasonal differencing
+D <- nsdiffs(log_calls)  # Suggested seasonal differencing
+cat("Suggested: d =", d, ", D =", D, "\n")
+
+#first apply seasonal differencing
+if (D > 0) {
+  calls_seasdiff <- diff(log_calls, lag = frequency(log_calls), differences = D)
+} else {
+  calls_seasdiff <- log_calls
+}
+
+# Plot seasonally differenced series
+plot(calls_seasdiff, main = "After Seasonal Differencing", 
+     ylab = "Differenced value",
+     xlab = "Time")
+abline(mean(calls_seasdiff), 0,
+       col= 'red')
+```
+
+```{r}
+# ACF of seasonally differenced series
+acf(calls_seasdiff, lag.max = 60, main = "ACF after seasonal differencing")
+
+# PACF of seasonally differenced series
+pacf(calls_seasdiff, lag.max = 60, main = "PACF after seasonal differencing")
+
+cat("variance of origninal log transformed series", var(log_calls, na.rm=TRUE))
+cat("variance of transformed log transformed series", var(calls_seasdiff, na.rm=TRUE))         # variance of transformed series
+
+# Ljung box test to check stationarity
+LB_test <- Box.test(calls_seasdiff, lag = 24, type = "Ljung-Box")
+cat("p value of box test",LB_test$p.value )
+```
+
+# Model Identification and Diagnostic Checking
+
+```{r Model Identification}
+
+# from seasonally differenced ACF and PACF plot suggested AR and MA 
+# values are (p=1,2), (q=(1,2)), (P=(0,1)), (Q=(0,1))
+
+# seasonal ARIMA (p,d,q)(P,D,Q)[S] applied on differenced series
+
+# ARIMA(1,1,1)(0,1,0)[12]
+fit_sarima1 <- Arima(log_calls, 
+                     order = c(1,1,1),   # non-seasonal ARIMA(p,d,q)       
+                     seasonal = list(order = c(0,1,0), period = 12),  #seasonal ARIMA(P,D,Q)[s]
+                     include.mean = TRUE)
+
+# ARIMA(1,1,1)(1,1,0)[12]
+fit_sarima2 <- Arima(log_calls, 
+                     order = c(1,1,1),          
+                     seasonal = list(order = c(1,1,0), period = 12),
+                     include.mean = TRUE)
+
+# ARIMA(1,1,1)(1,1,1)[12]
+fit_sarima3 <- Arima(log_calls, 
+                     order = c(1,1,1),           
+                     seasonal = list(order = c(1,1,1), period = 12),  
+                     include.constant = TRUE)
+
+# ARIMA(2,1,1)(1,1,1)[12]
+fit_sarima4 <- Arima(log_calls, 
+                     order = c(2,1,1),           
+                     seasonal = list(order = c(1,1,1), period = 12),  
+                     include.constant = TRUE)
+
+cat("\n=== SARIMA(1,1,1)(0,1,0)[12] MODEL FITTED ON  DATA ===\n")
+summary(fit_sarima1)
+cat("\n=== SARIMA(1,1,1)(0,1,0)[12] MODEL FITTED ON  DATA ===\n")
+summary(fit_sarima2)
+cat("\n=== SARIMA(1,1,1)(0,1,0)[12] MODEL FITTED ON  DATA ===\n")
+summary(fit_sarima3)
+cat("\n=== SARIMA(1,1,1)(0,1,0)[12] MODEL FITTED ON  DATA ===\n")
+summary(fit_sarima4)
+
+res1 <- checkresiduals(fit_sarima1)
+res2 <- checkresiduals(fit_sarima2)
+res3 <- checkresiduals(fit_sarima3)
+res4 <- checkresiduals(fit_sarima4)
+```
+# Compare all models
+
+```{r compare all models}
+
+fits <- list(
+  SARIMA_111_010 = fit_sarima1,
+  SARIMA_111_110 = fit_sarima2,
+  SARIMA_111_111 = fit_sarima3,
+  SARIMA_211_111 = fit_sarima4
+)
+
+# Initialize vectors
+model_names <- c()
+AIC_vals <- c()
+BIC_vals <- c()
+AICC_vals <- c()
+RMSE_vals <- c()
+MAE_vals <- c()
+LB_pvals <- c()
+
+for (name in names(fits)) {
+  fit <- fits[[name]]
+  model_names <- c(model_names, name)
+  AIC_vals <- c(AIC_vals, AIC(fit))
+  BIC_vals <- c(BIC_vals, BIC(fit))
+  AICC_vals <- c(AICC_vals, fit$aicc)
+  
+  
+  # residuals
+  res <- residuals(fit)
+  RMSE_vals <- c(RMSE_vals, sqrt(mean(res^2)))
+  MAE_vals <- c(MAE_vals, mean(abs(res)))
+  
+  # Ljung-Box test on residuals
+  LB_test <- Box.test(res, lag = 24, type = "Ljung-Box")
+  LB_pvals <- c(LB_pvals, LB_test$p.value)
+}
+
+# Create data frame
+comparison_table <- data.frame(
+  Model = model_names,
+  AIC = round(AIC_vals, 3),
+  BIC = round(BIC_vals, 3),
+  AICC = round(AICC_vals, 3),
+  RMSE = round(RMSE_vals, 3),
+  MAE = round(MAE_vals, 3),
+  Ljung_Box_p = round(LB_pvals, 3)
+)
+
+cat("comparison_table", capture.output(comparison_table), sep = "\n")
+
+
+# Plot residuals side by side
+p_res1 <- autoplot(fit_sarima1$residuals) + 
+  ggtitle("Residuals: SARIMA(1,0,1)(1,1,1)[12]") + 
+  theme_minimal()
+p_res2 <- autoplot(fit_sarima2$residuals) + 
+  ggtitle("Residuals: SARIMA(0,0,1)(1,1,1)[12]") + 
+  theme_minimal()
+p_res3 <- autoplot(fit_sarima3$residuals) + 
+  ggtitle("Residuals: SARIMA(1,1,0)(1,1,1)[12]") + 
+  theme_minimal()
+p_res4 <- autoplot(fit_sarima4$residuals) + 
+  ggtitle("Residuals: SARIMA(1,1,0)(1,1,1)[12]") + 
+  theme_minimal()
+
+grid.arrange(p_res1, p_res2, p_res3,p_res4, ncol=2)
+
+```
+
+# Final model
+
+```{r final model}
+
+final_fit <- fit_sarima4
+res <- residuals(final_fit)
+
+# Residual time plot
+plot(res,
+     main = "Residuals over time (final model)",
+     ylab = "Residuals", xlab = "Time")
+abline(h = 0, col = "red", lwd = 2)
+
+# Residual ACF 
+acf(res, lag.max = 60, main = "ACF of residuals")
+pacf(res, lag.max = 60, main = "PACF of residuals")
+
+# Histogram and density plot 
+hist(res, breaks = 20, probability = TRUE,
+     main = "Histogram of residuals",
+     xlab = "Residuals")
+lines(density(res, na.rm = TRUE), col = "red", lwd = 2)
+
+# Q–Q plot (normality check)
+qqnorm(res, main = "Q–Q plot of residuals")
+qqline(res, col = "red", lwd = 2)
+
+# Combined diagnostic 
+checkresiduals(final_fit)
+
+lb <- Box.test(res,
+               lag = 24,
+               type = "Ljung-Box",
+               fitdf = length(coef(final_fit)))
+print(lb)
+```
+
