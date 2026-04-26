@@ -1,0 +1,10 @@
+# Ignore datasets
+*.txt
+
+# R files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Mac system file
+.DS_Store
